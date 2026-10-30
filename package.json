@@ -1,0 +1,13 @@
+{
+  "name": "form-journal-live",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A personal architecture reading room",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
