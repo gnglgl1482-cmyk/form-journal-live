@@ -1,16 +1,14 @@
 // server.mjs
 // FORM — 공개 홈페이지용
-// Node.js 20 이상 / 외부 패키지 없음
+// Node.js 20 이상 / 외부 패키지 불필요
 //
-// 개인 목록: 방문자의 브라우저에 저장
-// 서버: 기사 검색 / 대표 이미지 확인 / 캐시
-//
-// 로컬 실행: node server.mjs
+// 실행: node server.mjs
+// 문법 검사: node --check server.mjs
 
 import http from "node:http";
 import https from "node:https";
 import dns from "node:dns/promises";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 const PORT = Number(process.env.PORT) || 3000;
 const NEWS_TTL = 30 * 60 * 1000;
@@ -86,7 +84,7 @@ const DEFAULT_ARCHITECTS = [
   }
 ];
 
-// 이 명단의 수록 범위는 1979~2025년입니다.
+// 수록 범위: 1979~2026년
 // 공식 출처: https://www.pritzkerprize.com/laureates
 const PRITZKER = [
   [1979, ["Philip Johnson"]],
@@ -135,7 +133,7 @@ const PRITZKER = [
   [2022, ["Diébédo Francis Kéré"]],
   [2023, ["David Chipperfield"]],
   [2024, ["Riken Yamamoto"]],
-  [2025, ["Liu Jiakun"]]
+  [2025, ["Liu Jiakun"]],
   [2026, ["Smiljan Radić Clarke"]]
 ];
 
@@ -172,7 +170,24 @@ const LAUREATE_KEYWORDS = {
   "Diébédo Francis Kéré": ["Francis Kere", "Kere Architecture"],
   "Riken Yamamoto": ["Riken Yamamoto Field Shop"],
   "Liu Jiakun": ["Jiakun Architects", "West Village Chengdu"],
-  "Smiljan Radić Clarke": ["Smiljan Radic", "Smiljan Radić", "Serpentine Pavilion 2014", "Teatro Regional del Biobio"]
+  "Smiljan Radić Clarke": [
+    "Smiljan Radic",
+    "Smiljan Radić",
+    "Serpentine Pavilion 2014",
+    "Teatro Regional del Biobio"
+  ]
+};
+
+const CATALOG = {
+  defaults: DEFAULT_ARCHITECTS,
+  throughYear: 2026,
+  laureates: PRITZKER.map(([year, names]) => ({
+    year,
+    people: names.map(name => ({
+      name,
+      keywords: LAUREATE_KEYWORDS[name] || []
+    }))
+  }))
 };
 
 const queryCache = new Map();
@@ -183,23 +198,27 @@ const previewPending = new Map();
 const rateBuckets = new Map();
 
 // --------------------------------------------------
-// ユーティリティ / 공통 처리
+// 공통 처리
 // --------------------------------------------------
 
 function hash(value) {
   return createHash("sha256").update(value).digest("hex").slice(0, 24);
 }
 
-function norm(value) {
+function normalize(value) {
   return String(value).normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase().replace(/\s+/g, " ").trim();
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function cleanText(value, max = 100) {
   return String(value || "")
     .replace(/["\\\u0000-\u001f]/g, "")
-    .replace(/\s+/g, " ").trim().slice(0, max);
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
 }
 
 function cleanKeywords(value) {
@@ -213,7 +232,7 @@ function cleanKeywords(value) {
   for (const item of items) {
     if (typeof item !== "string") continue;
     const text = cleanText(item);
-    const key = norm(text);
+    const key = normalize(text);
     if (text.length < 2 || seen.has(key)) continue;
     seen.add(key);
     result.push(text);
@@ -236,8 +255,10 @@ function decodeEntities(value = "") {
       if (!entity.startsWith("#")) {
         return named[entity.toLowerCase()] ?? match;
       }
+
       const hex = entity[1]?.toLowerCase() === "x";
       const code = parseInt(entity.slice(hex ? 2 : 1), hex ? 16 : 10);
+
       return Number.isFinite(code) && code >= 0 && code <= 0x10ffff
         ? String.fromCodePoint(code)
         : match;
@@ -266,6 +287,7 @@ function readTag(xml, name) {
   const match = xml.match(
     new RegExp("<" + name + "\\b[^>]*>([\\s\\S]*?)</" + name + ">", "i")
   );
+
   if (!match) return "";
 
   let value = match[1].trim();
@@ -280,7 +302,8 @@ function readTag(xml, name) {
 function attribute(tag, name) {
   const match = tag.match(new RegExp(
     "(?:^|\\s)" + name +
-    "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", "i"
+    "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))",
+    "i"
   ));
 
   return match
@@ -303,11 +326,24 @@ function uniqueImages(items) {
   return [...new Set(items.filter(Boolean))].slice(0, 6);
 }
 
-function boundedSet(map, key, value, max) {
+function boundedSet(map, key, value, limit) {
   if (map.has(key)) map.delete(key);
   map.set(key, value);
-  while (map.size > max) map.delete(map.keys().next().value);
+  while (map.size > limit) map.delete(map.keys().next().value);
 }
+
+function safeJSON(value) {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
+// --------------------------------------------------
+// 요청 제한
+// --------------------------------------------------
 
 function createLimiter(limit, maxQueue) {
   let active = 0;
@@ -316,7 +352,7 @@ function createLimiter(limit, maxQueue) {
   return async function run(task) {
     if (active >= limit) {
       if (queue.length >= maxQueue) {
-        throw new Error("서버가 혼잡합니다. 잠시 후 다시 시도해주세요.");
+        throw new Error("서버가 혼잡합니다.");
       }
       await new Promise(resolve => queue.push(resolve));
     } else {
@@ -336,11 +372,6 @@ function createLimiter(limit, maxQueue) {
 const limitNews = createLimiter(4, 80);
 const limitPreview = createLimiter(3, 60);
 
-// --------------------------------------------------
-// 간단한 요청 제한
-// 대규모 서비스용 인증 / 방화벽을 대신하지 않습니다.
-// --------------------------------------------------
-
 function allowRate(key, limit, windowMs = 60000) {
   const now = Date.now();
   let bucket = rateBuckets.get(key);
@@ -356,10 +387,11 @@ function allowRate(key, limit, windowMs = 60000) {
 
 function clientKey(request) {
   if (process.env.RENDER) {
-    const forwarded = String(request.headers["x-forwarded-for"] || "");
-    const parts = forwarded.split(",").map(x => x.trim()).filter(Boolean);
+    const parts = String(request.headers["x-forwarded-for"] || "")
+      .split(",").map(x => x.trim()).filter(Boolean);
     if (parts.length) return parts[parts.length - 1];
   }
+
   return request.socket.remoteAddress || "unknown";
 }
 
@@ -371,17 +403,19 @@ setInterval(() => {
 }, 60000).unref();
 
 // --------------------------------------------------
-// 외부 문서 요청
-// 사설 / 로컬 네트워크 접근 방지
+// 외부 요청
 // --------------------------------------------------
 
 function isPublicIPv4(ip) {
-  const p = ip.split(".").map(Number);
-  if (p.length !== 4 || p.some(n => !Number.isInteger(n) || n < 0 || n > 255)) {
-    return false;
-  }
+  const parts = ip.split(".").map(Number);
 
-  const [a, b, c] = p;
+  if (
+    parts.length !== 4 ||
+    parts.some(n => !Number.isInteger(n) || n < 0 || n > 255)
+  ) return false;
+
+  const [a, b, c] = parts;
+
   if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
   if (a === 100 && b >= 64 && b <= 127) return false;
   if (a === 169 && b === 254) return false;
@@ -390,6 +424,7 @@ function isPublicIPv4(ip) {
   if (a === 198 && (b === 18 || b === 19)) return false;
   if (a === 198 && b === 51 && c === 100) return false;
   if (a === 203 && b === 0 && c === 113) return false;
+
   return true;
 }
 
@@ -401,7 +436,8 @@ async function getRemoteText(input, redirects = 0) {
   if (
     url.protocol !== "https:" ||
     (url.port && url.port !== "443") ||
-    url.username || url.password
+    url.username ||
+    url.password
   ) throw new Error("HTTPS 주소만 허용합니다.");
 
   const addresses = await dns.lookup(url.hostname, {
@@ -424,15 +460,23 @@ async function getRemoteText(input, redirects = 0) {
       },
 
       lookup(hostname, options, callback) {
-        if (options?.all) callback(null, [{ address: ip, family: 4 }]);
-        else callback(null, ip, 4);
+        if (options?.all) {
+          callback(null, [{ address: ip, family: 4 }]);
+        } else {
+          callback(null, ip, 4);
+        }
       }
     }, response => {
       const status = response.statusCode || 0;
 
-      if ([301, 302, 303, 307, 308].includes(status) && response.headers.location) {
+      if (
+        [301, 302, 303, 307, 308].includes(status) &&
+        response.headers.location
+      ) {
         response.resume();
-        resolve({ redirect: new URL(response.headers.location, url).href });
+        resolve({
+          redirect: new URL(response.headers.location, url).href
+        });
         return;
       }
 
@@ -447,10 +491,12 @@ async function getRemoteText(input, redirects = 0) {
 
       response.on("data", chunk => {
         size += chunk.length;
+
         if (size > 2 * 1024 * 1024) {
           response.destroy(new Error("문서 크기 제한 초과"));
           return;
         }
+
         chunks.push(chunk);
       });
 
@@ -462,10 +508,9 @@ async function getRemoteText(input, redirects = 0) {
       response.on("error", reject);
     });
 
-    const timer = setTimeout(
-      () => request.destroy(new Error("외부 요청 시간 초과")),
-      10000
-    );
+    const timer = setTimeout(() => {
+      request.destroy(new Error("외부 요청 시간 초과"));
+    }, 10000);
 
     request.on("close", () => clearTimeout(timer));
     request.on("error", reject);
@@ -477,7 +522,7 @@ async function getRemoteText(input, redirects = 0) {
 }
 
 // --------------------------------------------------
-// RSS 이미지 / 명시적 건축 정보
+// RSS 정보
 // --------------------------------------------------
 
 function extractRssImages(item, description, baseUrl) {
@@ -512,7 +557,6 @@ function extractRssImages(item, description, baseUrl) {
   add(readTag(item, "News:ThumbnailUrl"));
 
   const block = readTag(item, "image");
-
   if (block) {
     add(readTag(block, "url"));
     if (/^https?:\/\//i.test(block)) add(block);
@@ -578,7 +622,7 @@ function unwrapNewsUrl(value) {
 }
 
 async function searchNews(term) {
-  const key = norm(term);
+  const key = normalize(term);
   const cached = queryCache.get(key);
 
   if (cached && Date.now() - cached.time < NEWS_TTL) {
@@ -589,7 +633,7 @@ async function searchNews(term) {
 
   const job = limitNews(async () => {
     if (!allowRate("outbound-news", 90)) {
-      throw new Error("전체 검색량이 많습니다. 잠시 후 다시 시도해주세요.");
+      throw new Error("검색 요청이 많습니다.");
     }
 
     const url = new URL("https://www.bing.com/news/search");
@@ -602,6 +646,7 @@ async function searchNews(term) {
     }).toString();
 
     const { text } = await getRemoteText(url.href);
+
     if (!/<rss\b/i.test(text)) throw new Error("RSS 형식 오류");
 
     const items = text.match(/<item\b[^>]*>[\s\S]*?<\/item>/gi) || [];
@@ -640,6 +685,8 @@ async function searchNews(term) {
 
       if (articles.length >= 12) break;
     }
+
+    console.log("[검색]", term, "→", articles.length + "개");
 
     boundedSet(queryCache, key, {
       time: Date.now(),
@@ -680,7 +727,6 @@ async function collectFeed(name, keywords) {
     const { term, articles } = result.value;
 
     for (const article of articles) {
-      // 캐시된 검색 결과에서도 상세 정보 조회가 가능하도록 복원
       boundedSet(articleStore, article.id, article, 800);
 
       if (!merged.has(article.id)) {
@@ -697,7 +743,7 @@ async function collectFeed(name, keywords) {
   }
 
   if (failed === terms.length) {
-    throw new Error("검색을 완료하지 못했습니다. 잠시 후 다시 시도해주세요.");
+    throw new Error("모든 검색 요청이 실패했습니다.");
   }
 
   return {
@@ -713,8 +759,7 @@ async function collectFeed(name, keywords) {
 }
 
 // --------------------------------------------------
-// 원문 대표 이미지 메타정보
-// 서버가 검색으로 확인한 기사만 조회합니다.
+// 대표 이미지
 // --------------------------------------------------
 
 function extractPreviewImages(html, baseUrl) {
@@ -763,11 +808,12 @@ async function getArticleWithPreview(id) {
 
     try {
       if (!allowRate("outbound-preview", 90)) {
-        throw new Error("이미지 확인 요청이 많습니다.");
+        throw new Error("이미지 요청이 많습니다.");
       }
 
       const page = await getRemoteText(article.url);
       images = extractPreviewImages(page.text, page.url);
+
       if (images.length) ttl = 60 * 60 * 1000;
     } catch (error) {
       console.log("[이미지 확인 불가]", article.source, error.message);
@@ -796,14 +842,17 @@ async function getArticleWithPreview(id) {
 
 // --------------------------------------------------
 // 홈페이지
+// 목록 데이터를 HTML 안에 포함하여
+// 목록 표시가 API 연결에 의존하지 않도록 구성합니다.
 // --------------------------------------------------
 
-const HTML = String.raw`<!DOCTYPE html>
+const PAGE = String.raw`<!DOCTYPE html>
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FORM — Follow the Trace</title>
+
 <style>
 :root{--ink:#181818;--muted:#858585;--line:#e8e8e8;--soft:#f7f7f7}
 *{box-sizing:border-box}
@@ -817,7 +866,9 @@ button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,
 header{border-bottom:1px solid var(--line)}
 .nav{height:76px;display:flex;align-items:center;justify-content:space-between;gap:20px}
 .logo{text-decoration:none;font-size:28px;font-weight:750;letter-spacing:-1.8px}
-.nav-note{color:var(--muted);font-size:10px}
+.connection{color:var(--muted);font-size:11px}
+.connection.ok{color:#46704c}
+.connection.error{color:#ad4e4e}
 .hero{padding:76px 0 60px}
 .eyebrow{font-size:10px;font-weight:600;letter-spacing:2px;text-transform:uppercase}
 .hero h1{margin:28px 0 22px;font-size:clamp(48px,7.4vw,88px);font-weight:650;line-height:1.07;letter-spacing:-4.6px}
@@ -906,7 +957,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
 }
 @media(max-width:600px){
 .wrap,.detail-wrap{width:calc(100% - 32px)}
-.nav{height:65px}.nav-note{display:none}
+.nav{height:65px}.connection{font-size:9px}
 .hero{padding:56px 0 46px}
 .hero h1{font-size:clamp(40px,9vw,54px);letter-spacing:-2.5px}
 .eyebrow{font-size:8px;letter-spacing:1.5px}
@@ -921,11 +972,12 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
 }
 </style>
 </head>
+
 <body>
 <header>
   <div class="wrap nav">
     <a class="logo" href="#home">FORM.</a>
-    <span class="nav-note">YOUR OWN ARCHITECTURE READING ROOM</span>
+    <span id="connection" class="connection" role="status">서버 연결 확인 중</span>
   </div>
 </header>
 
@@ -958,7 +1010,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
         <button class="black-button" type="submit">추가하고 팔로우 +</button>
       </div>
       <p id="addMessage" class="message" role="status" aria-live="polite">
-        목록은 이 브라우저에 저장됩니다. 친구의 목록에는 영향을 주지 않습니다.
+        목록은 이 브라우저에 저장됩니다. 동시에 팔로우할 수 있는 건축가는 최대 6명입니다.
       </p>
     </form>
 
@@ -972,7 +1024,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
     <input id="search" class="search" type="search"
       aria-label="기사 검색" placeholder="기사, 건축가, 매체, 관련 프로젝트 검색">
 
-    <p id="status" class="status" role="status" aria-live="polite">서버에 연결하고 있습니다…</p>
+    <p id="status" class="status" role="status" aria-live="polite"></p>
     <div id="feed" class="grid"></div>
   </section>
 
@@ -986,7 +1038,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
           공식 명단 ↗
         </a>
       </p>
-      <p>수상자를 추가하면 나의 건축가 목록에 등록됩니다.</p>
+      <p>수상자를 내 목록에 추가하고 관련 기사를 찾아보세요.</p>
     </div>
 
     <div class="awards-tools">
@@ -996,6 +1048,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
         <option value="asc">과거순</option>
       </select>
     </div>
+
     <div id="awardsList" class="awards-list"></div>
   </section>
 </main>
@@ -1008,31 +1061,34 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
 <footer>
   <div class="wrap">
     FORM. — FOLLOW THE TRACE<br>
-    개인 목록은 현재 브라우저에 저장됩니다. 기기 간 동기화는 제공하지 않습니다.<br>
-    검색어는 기사 수집을 위해 서버와 Bing News로 전달됩니다.<br>
-    기사 소개는 RSS 제공 문구입니다. 기사 및 이미지의 저작권은 각 원 저작권자에게 있습니다.
+    개인 목록은 현재 브라우저에 저장되며 기기 간 동기화는 제공하지 않습니다.<br>
+    검색어는 서버와 Bing News로 전달됩니다. 뉴스 결과는 약 30분간 재사용될 수 있습니다.<br>
+    기사 소개는 RSS 제공 문구이며 기사와 이미지의 저작권은 각 원 저작권자에게 있습니다.
   </div>
 </footer>
 
-<script>
+<script nonce="__NONCE__" id="formCatalog" type="application/json">__CATALOG__</script>
+
+<script nonce="__NONCE__">
 (function () {
+  var CATALOG = JSON.parse(document.getElementById("formCatalog").textContent);
   var STATE_KEY = "form-public-state-v1";
   var ARTICLE_KEY = "form-public-articles-v1";
+  var MAX_FOLLOW = 6;
 
-  var catalog = null;
-  var state = null;
+  var state;
   var articleCache = new Map();
   var articles = [];
-  var initialized = false;
-  var initializing = null;
+  var previewRequests = new Map();
+
   var loading = false;
-  var version = 0;
+  var requestVersion = 0;
   var notice = "";
   var storageWarning = "";
+  var searchTimer = null;
 
   var imageObserver = null;
   var imageCards = new WeakMap();
-  var previewRequests = new Map();
 
   var home = document.getElementById("home");
   var detail = document.getElementById("detail");
@@ -1040,6 +1096,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
   var feed = document.getElementById("feed");
   var search = document.getElementById("search");
   var status = document.getElementById("status");
+  var connection = document.getElementById("connection");
 
   function el(tag, className, text) {
     var node = document.createElement(tag);
@@ -1054,23 +1111,24 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
       .toLowerCase().replace(/\s+/g, " ").trim();
   }
 
-  function cleanName(value, max) {
+  function clean(value, max) {
     return String(value || "")
       .replace(/["\\\u0000-\u001f]/g, "")
-      .replace(/\s+/g, " ").trim().slice(0, max || 80);
+      .replace(/\s+/g, " ")
+      .trim().slice(0, max || 80);
   }
 
-  function keywords(value) {
-    var items = Array.isArray(value) ? value : String(value || "").split(/[,，\n]/);
+  function parseKeywords(value) {
+    var list = Array.isArray(value) ? value : String(value || "").split(/[,，\n]/);
     var seen = new Set();
 
-    return items.filter(function (item) {
-      return typeof item === "string";
-    }).map(function (item) {
-      return cleanName(item, 100);
-    }).filter(function (item) {
-      var key = norm(item);
-      if (item.length < 2 || seen.has(key)) return false;
+    return list.filter(function (x) {
+      return typeof x === "string";
+    }).map(function (x) {
+      return clean(x, 100);
+    }).filter(function (x) {
+      var key = norm(x);
+      if (x.length < 2 || seen.has(key)) return false;
       seen.add(key);
       return true;
     }).slice(0, 8);
@@ -1089,8 +1147,19 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
     return value ? new Date(value).toLocaleDateString("ko-KR") : "발행일 미상";
   }
 
-  async function requestJSON(url, data) {
-    var options = { signal: AbortSignal.timeout(120000) };
+  function setConnection(ok, text) {
+    connection.className = "connection " + (ok ? "ok" : "error");
+    connection.textContent = text;
+  }
+
+  async function api(url, data, timeout) {
+    if (!["http:", "https:"].includes(location.protocol)) {
+      throw new Error("파일로 열 수 없습니다. 실행 중인 서버 또는 Render 주소로 접속해주세요.");
+    }
+
+    var options = {
+      signal: AbortSignal.timeout(timeout || 120000)
+    };
 
     if (data !== undefined) {
       options.method = "POST";
@@ -1098,7 +1167,20 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
       options.body = JSON.stringify(data);
     }
 
-    var response = await fetch(url, options);
+    var response;
+
+    try {
+      response = await fetch(url, options);
+    } catch (error) {
+      throw new Error("서버 응답이 없습니다. 서버 실행 상태와 접속 주소를 확인해주세요.");
+    }
+
+    var type = response.headers.get("content-type") || "";
+
+    if (!type.includes("application/json")) {
+      throw new Error("검색 서버가 아닌 페이지에 연결되었습니다. Render 서비스 주소인지 확인해주세요.");
+    }
+
     var result = await response.json();
 
     if (!response.ok) {
@@ -1108,41 +1190,46 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
     return result;
   }
 
+  async function checkConnection() {
+    try {
+      var result = await api("/health", undefined, 60000);
+      if (!result.ok) throw new Error("서버 상태 확인 실패");
+      setConnection(true, "검색 서버 연결됨");
+      return true;
+    } catch (error) {
+      setConnection(false, "검색 서버 연결 안 됨");
+      notice = error.message;
+      renderFeed();
+      return false;
+    }
+  }
+
   function saveState() {
     try {
       localStorage.setItem(STATE_KEY, JSON.stringify(state));
     } catch (error) {
-      storageWarning = "브라우저에 목록을 저장하지 못했습니다.";
+      storageWarning = "브라우저 저장 공간을 사용할 수 없어 목록이 유지되지 않을 수 있습니다.";
     }
   }
 
   function saveArticles() {
     try {
-      var recent = Array.from(articleCache.values()).slice(-100);
-      localStorage.setItem(ARTICLE_KEY, JSON.stringify(recent));
-    } catch (error) {
-      // 기사 캐시 저장 실패는 검색 기능을 막지 않습니다.
-    }
+      localStorage.setItem(
+        ARTICLE_KEY,
+        JSON.stringify(Array.from(articleCache.values()).slice(-100))
+      );
+    } catch (error) {}
   }
-
-  try {
-    var savedArticles = JSON.parse(localStorage.getItem(ARTICLE_KEY) || "[]");
-    if (Array.isArray(savedArticles)) {
-      savedArticles.forEach(function (a) {
-        if (a && /^[a-f0-9]{24}$/.test(a.id) && validUrl(a.url)) {
-          articleCache.set(a.id, a);
-        }
-      });
-    }
-  } catch (error) {}
 
   function cacheArticle(article) {
     articleCache.delete(article.id);
     articleCache.set(article.id, article);
-    while (articleCache.size > 100) articleCache.delete(articleCache.keys().next().value);
+    while (articleCache.size > 100) {
+      articleCache.delete(articleCache.keys().next().value);
+    }
   }
 
-  function loadState() {
+  function loadLocalData() {
     try {
       var saved = JSON.parse(localStorage.getItem(STATE_KEY) || "null");
 
@@ -1151,33 +1238,48 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
 
         var list = saved.architects.filter(function (a) {
           if (!a || typeof a.id !== "string" || typeof a.name !== "string") return false;
-          if (seen.has(a.id)) return false;
+          if (seen.has(a.id) || clean(a.name).length < 2) return false;
           seen.add(a.id);
-          return cleanName(a.name).length >= 2;
-        }).map(function (a) {
+          return true;
+        }).slice(0, 100).map(function (a) {
           return {
             id: a.id,
-            name: cleanName(a.name),
-            korean: cleanName(a.korean || "나의 건축가", 100),
-            country: cleanName(a.country || "My collection", 100),
-            keywords: keywords(a.keywords)
+            name: clean(a.name),
+            korean: clean(a.korean || "나의 건축가", 100),
+            country: clean(a.country || "My collection", 100),
+            keywords: parseKeywords(a.keywords)
           };
         });
 
         state = {
           architects: list,
-          followed: saved.followed.filter(function (id) {
+          followed: Array.from(new Set(saved.followed)).filter(function (id) {
             return list.some(function (a) { return a.id === id; });
-          })
+          }).slice(0, MAX_FOLLOW)
         };
-        return;
       }
     } catch (error) {}
 
-    state = {
-      architects: JSON.parse(JSON.stringify(catalog.defaults)),
-      followed: []
-    };
+    if (!state) {
+      state = {
+        architects: JSON.parse(JSON.stringify(CATALOG.defaults)),
+        followed: []
+      };
+    }
+
+    try {
+      var cached = JSON.parse(localStorage.getItem(ARTICLE_KEY) || "[]");
+
+      if (Array.isArray(cached)) {
+        cached.slice(-100).forEach(function (article) {
+          if (
+            article &&
+            /^[a-f0-9]{24}$/.test(article.id) &&
+            validUrl(article.url)
+          ) cacheArticle(article);
+        });
+      }
+    } catch (error) {}
   }
 
   function isFollowed(id) {
@@ -1198,34 +1300,55 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
     second.setAttribute("aria-pressed", String(awards));
   }
 
+  function scheduleSearch() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(loadNews, 400);
+  }
+
+  function follow(id) {
+    if (isFollowed(id)) return true;
+
+    if (state.followed.length >= MAX_FOLLOW) {
+      alert("동시에 팔로우할 수 있는 건축가는 최대 6명입니다. 다른 건축가의 팔로우를 해제해주세요.");
+      return false;
+    }
+
+    state.followed.push(id);
+    return true;
+  }
+
   function toggleFollow(id) {
     if (isFollowed(id)) {
       state.followed = state.followed.filter(function (x) { return x !== id; });
-    } else {
-      state.followed.push(id);
+    } else if (!follow(id)) {
+      return;
     }
 
     saveState();
     renderProfiles();
     renderAwards();
-    loadNews();
+    scheduleSearch();
   }
 
-  function addToMyList(name, related, extra) {
-    name = cleanName(name);
-    if (name.length < 2) throw new Error("이름을 2자 이상 입력해주세요.");
+  function addArchitect(name, related, extra) {
+    name = clean(name);
+    if (name.length < 2) throw new Error("건축가 이름을 2자 이상 입력해주세요.");
 
     var existing = state.architects.find(function (a) {
       return norm(a.name) === norm(name);
     });
 
     if (existing) {
-      if (!isFollowed(existing.id)) state.followed.push(existing.id);
+      follow(existing.id);
       saveState();
       return existing;
     }
 
-    var base = catalog.defaults.find(function (a) {
+    if (state.architects.length >= 100) {
+      throw new Error("건축가 목록은 최대 100명까지 저장할 수 있습니다.");
+    }
+
+    var base = CATALOG.defaults.find(function (a) {
       return norm(a.name) === norm(name);
     });
 
@@ -1238,20 +1361,24 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
       name: name,
       korean: extra && extra.korean || "직접 추가한 건축가",
       country: extra && extra.country || "My collection",
-      keywords: keywords(related)
+      keywords: parseKeywords(related)
     };
 
-    if (base && keywords(related).length) {
-      profile.keywords = keywords(base.keywords.concat(keywords(related)));
+    if (base && parseKeywords(related).length) {
+      profile.keywords = parseKeywords(base.keywords.concat(parseKeywords(related)));
     }
 
     state.architects.push(profile);
-    state.followed.push(profile.id);
+
+    if (state.followed.length < MAX_FOLLOW) {
+      state.followed.push(profile.id);
+    }
+
     saveState();
     return profile;
   }
 
-  function removeArchitect(architect) {
+  function deleteArchitect(architect) {
     if (!confirm(
       architect.name + "을(를) 내 목록에서 삭제할까요?\n" +
       "다른 사람의 목록과 프리츠커 수상 이력에는 영향을 주지 않습니다."
@@ -1267,7 +1394,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
     saveState();
     renderProfiles();
     renderAwards();
-    loadNews();
+    scheduleSearch();
   }
 
   function renderProfiles() {
@@ -1287,11 +1414,13 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
       var card = el("article", "profile" + (active ? " selected" : ""));
       var actions = el("div", "profile-actions");
 
-      var follow = el("button", "follow", active ? "✓ 팔로잉" : "+ 팔로우");
-      follow.type = "button";
-      follow.setAttribute("aria-pressed", String(active));
-      follow.setAttribute("aria-label", architect.name + (active ? " 팔로우 해제" : " 팔로우"));
-      follow.addEventListener("click", function () { toggleFollow(architect.id); });
+      var followButton = el("button", "follow", active ? "✓ 팔로잉" : "+ 팔로우");
+      followButton.type = "button";
+      followButton.setAttribute("aria-pressed", String(active));
+      followButton.setAttribute("aria-label", architect.name + (active ? " 팔로우 해제" : " 팔로우"));
+      followButton.addEventListener("click", function () {
+        toggleFollow(architect.id);
+      });
 
       var edit = el("button", "edit", "검색어 수정");
       edit.type = "button";
@@ -1299,10 +1428,13 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
 
       var remove = el("button", "delete", "삭제");
       remove.type = "button";
-      remove.addEventListener("click", function () { removeArchitect(architect); });
+      remove.addEventListener("click", function () {
+        deleteArchitect(architect);
+      });
 
       var editor = el("form", "editor");
       editor.hidden = true;
+
       var label = el("label", "", "관련 검색어 · 쉼표 또는 줄바꿈으로 구분");
       var textarea = el("textarea");
       textarea.value = architect.keywords.join(", ");
@@ -1330,13 +1462,14 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
 
       editor.addEventListener("submit", function (event) {
         event.preventDefault();
-        architect.keywords = keywords(textarea.value);
+        architect.keywords = parseKeywords(textarea.value);
         saveState();
         renderProfiles();
-        if (isFollowed(architect.id)) loadNews();
+        if (isFollowed(architect.id)) scheduleSearch();
       });
 
-      actions.append(follow, edit, remove);
+      actions.append(followButton, edit, remove);
+
       card.append(
         el("div", "country", architect.country),
         el("h3", "", architect.name),
@@ -1347,28 +1480,31 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
         actions,
         editor
       );
+
       profiles.append(card);
     });
 
     document.getElementById("followCount").textContent =
-      state.followed.length + "명 팔로우 · 내 목록 " + state.architects.length + "명";
+      state.followed.length + "/6명 팔로우 · 내 목록 " + state.architects.length + "명";
   }
 
   function renderAwards() {
-    if (!catalog || !state) return;
-
     var list = document.getElementById("awardsList");
     list.replaceChildren();
+
     var query = norm(document.getElementById("awardSearch").value);
     var asc = document.getElementById("awardSort").value === "asc";
     var count = 0;
 
-    catalog.laureates.slice().sort(function (a, b) {
+    CATALOG.laureates.slice().sort(function (a, b) {
       return asc ? a.year - b.year : b.year - a.year;
     }).forEach(function (row) {
       var people = row.people.filter(function (person) {
-        return !query || norm(person.name).includes(query) || String(row.year).includes(query);
+        return !query ||
+          norm(person.name).includes(query) ||
+          String(row.year).includes(query);
       });
+
       if (!people.length) return;
       count++;
 
@@ -1385,18 +1521,30 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
           : "+ 추가하고 팔로우");
 
         button.type = "button";
+
         button.addEventListener("click", function () {
           if (existing) {
             toggleFollow(existing.id);
-          } else {
-            addToMyList(person.name, person.keywords, {
+            return;
+          }
+
+          try {
+            var profile = addArchitect(person.name, person.keywords, {
               korean: row.year + " 프리츠커 수상자",
               country: "Pritzker Laureate"
             });
+
             renderProfiles();
             renderAwards();
             setTab("following");
-            loadNews();
+
+            if (!isFollowed(profile.id)) {
+              alert("내 목록에 추가했습니다. 현재 6명을 팔로우 중이므로 다른 팔로우를 해제한 뒤 선택해주세요.");
+            }
+
+            scheduleSearch();
+          } catch (error) {
+            alert(error.message);
           }
         });
 
@@ -1448,6 +1596,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
 
     function next() {
       if (!container.isConnected) return;
+
       if (index >= urls.length) {
         exhausted();
         return;
@@ -1456,6 +1605,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
       var current = ++attempt;
       var image = new Image();
       var timer;
+
       image.alt = title + " — 기사 대표 이미지";
       image.referrerPolicy = "no-referrer";
       image.decoding = "async";
@@ -1472,8 +1622,8 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
       image.onload = function () {
         if (current === attempt) clearTimeout(timer);
       };
-      image.onerror = fail;
 
+      image.onerror = fail;
       container.replaceChildren(image);
       timer = setTimeout(fail, 15000);
       image.src = urls[index++];
@@ -1485,16 +1635,17 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
   function getPreview(id) {
     if (!previewRequests.has(id)) {
       previewRequests.set(id,
-        requestJSON("/api/article/" + id).then(function (remote) {
+        api("/api/article/" + id).then(function (remote) {
           var saved = articleCache.get(id);
+
           if (saved) {
-            var updated = Object.assign({}, saved, remote, {
+            cacheArticle(Object.assign({}, saved, remote, {
               names: saved.names,
               matchedTerms: saved.matchedTerms
-            });
-            cacheArticle(updated);
+            }));
             saveArticles();
           }
+
           return remote;
         }).catch(function (error) {
           previewRequests.delete(id);
@@ -1502,6 +1653,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
         })
       );
     }
+
     return previewRequests.get(id);
   }
 
@@ -1532,10 +1684,13 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
       imageObserver = new IntersectionObserver(function (entries) {
         entries.forEach(function (entry) {
           if (!entry.isIntersecting) return;
+
           var target = entry.target;
           imageObserver.unobserve(target);
+
           var data = imageCards.get(target);
           imageCards.delete(target);
+
           if (data && target.isConnected) start(target, data);
         });
       }, { rootMargin: "150px" });
@@ -1550,21 +1705,29 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
     feed.replaceChildren();
 
     var query = norm(search.value);
-    var filtered = articles.filter(function (a) {
+
+    var filtered = articles.filter(function (article) {
       return norm([
-        a.title, a.source,
-        (a.names || []).join(" "),
-        (a.matchedTerms || []).join(" ")
+        article.title,
+        article.source,
+        (article.names || []).join(" "),
+        (article.matchedTerms || []).join(" ")
       ].join(" ")).includes(query);
     });
 
     var parts = [];
-    if (loading) parts.push("건축가와 관련 프로젝트를 검색하고 있습니다…");
-    else if (state && state.followed.length) parts.push(filtered.length + "개 기사 · 최신 발행순");
-    else parts.push("관심 건축가를 팔로우하거나 직접 추가해보세요.");
+
+    if (loading) {
+      parts.push("건축가와 관련 프로젝트를 검색하고 있습니다…");
+    } else if (state.followed.length) {
+      parts.push(filtered.length + "개 기사 · 최신 발행순");
+    } else {
+      parts.push("관심 건축가를 팔로우하거나 직접 추가해보세요.");
+    }
 
     if (notice) parts.push(notice);
     if (storageWarning) parts.push(storageWarning);
+
     status.textContent = parts.join(" · ");
     document.getElementById("refresh").disabled = loading;
 
@@ -1573,8 +1736,8 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
       box.append(
         el("strong", "", loading ? "Connecting the stories." : "Follow the trace."),
         el("p", "", loading
-          ? "첫 검색은 시간이 걸릴 수 있습니다."
-          : (query ? "다른 검색어를 입력해보세요." : "건축가를 팔로우하면 관련 기사를 모아드립니다."))
+          ? "첫 검색에는 시간이 걸릴 수 있습니다."
+          : (query ? "다른 검색어를 입력해보세요." : "위에서 건축가를 팔로우하면 관련 기사가 표시됩니다."))
       );
       feed.append(box);
       return;
@@ -1584,6 +1747,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
       var card = el("article", "card");
       var path = "#article=" + article.id;
       var thumb = el("a", "thumb");
+
       thumb.href = path;
       thumb.target = "_blank";
       thumb.rel = "noopener";
@@ -1616,13 +1780,16 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
   }
 
   async function loadNews() {
-    if (!state) return;
-    var current = ++version;
-    var selected = state.architects.filter(function (a) { return isFollowed(a.id); });
+    var current = ++requestVersion;
+    var selected = state.architects.filter(function (a) {
+      return isFollowed(a.id);
+    }).slice(0, MAX_FOLLOW);
+
     articles = [];
     notice = "";
     loading = selected.length > 0;
     renderFeed();
+
     if (!selected.length) return;
 
     var cursor = 0;
@@ -1633,16 +1800,18 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
     var merged = new Map();
 
     async function worker() {
-      while (cursor < selected.length && current === version) {
+      while (cursor < selected.length && current === requestVersion) {
         var architect = selected[cursor++];
 
         try {
-          var data = await requestJSON("/api/news", {
+          var data = await api("/api/news", {
             name: architect.name,
             keywords: architect.keywords
           });
 
-          if (current !== version) return;
+          if (current !== requestVersion) return;
+
+          setConnection(true, "검색 서버 연결됨");
           partial += data.failedTerms || 0;
 
           data.articles.forEach(function (article) {
@@ -1655,35 +1824,44 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
               }));
             } else {
               var existing = merged.get(article.id);
-              existing.names = Array.from(new Set(existing.names.concat([architect.name])));
+
+              existing.names = Array.from(new Set(
+                existing.names.concat([architect.name])
+              ));
+
               existing.matchedTerms = Array.from(new Set(
                 existing.matchedTerms.concat(article.matchedTerms || [])
               ));
+
               existing.images = Array.from(new Set(
                 existing.images.concat(article.images || [])
               )).slice(0, 6);
             }
           });
         } catch (error) {
-          if (current !== version) return;
+          if (current !== requestVersion) return;
           failed++;
           lastError = error.message;
         } finally {
-          if (current === version) {
+          if (current === requestVersion) {
             completed++;
+
             articles = Array.from(merged.values())
               .sort(function (a, b) {
-                return (Date.parse(b.publishedAt) || 0) - (Date.parse(a.publishedAt) || 0);
+                return (Date.parse(b.publishedAt) || 0) -
+                  (Date.parse(a.publishedAt) || 0);
               }).slice(0, 60);
 
             articles.forEach(cacheArticle);
             saveArticles();
 
             loading = completed < selected.length;
+
             var notes = [completed + "/" + selected.length + "명 확인"];
             if (failed) notes.push(failed + "명 검색 실패");
             if (partial) notes.push(partial + "개 검색어 확인 실패");
             if (failed && !articles.length && lastError) notes.push(lastError);
+
             notice = notes.join(" · ");
             renderFeed();
           }
@@ -1692,28 +1870,6 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
     }
 
     await Promise.all([worker(), worker()]);
-  }
-
-  async function ensureHome() {
-    if (initialized) return;
-    if (initializing) return initializing;
-
-    initializing = (async function () {
-      try {
-        catalog = await requestJSON("/api/catalog");
-        loadState();
-        initialized = true;
-        renderProfiles();
-        renderAwards();
-        loadNews();
-      } catch (error) {
-        status.textContent = "서버에 연결하지 못했습니다. 잠시 후 업데이트를 눌러주세요.";
-      } finally {
-        initializing = null;
-      }
-    })();
-
-    return initializing;
   }
 
   function section(title, content) {
@@ -1736,10 +1892,15 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
     content.append(heading);
 
     var photo = el("figure", "detail-photo");
-    content.append(photo, el("p", "image-note", "이미지 출처: " + article.source));
+    content.append(
+      photo,
+      el("p", "image-note", "이미지 출처: " + article.source)
+    );
 
     showOneImage(
-      photo, article.images || [], article.title,
+      photo,
+      article.images || [],
+      article.title,
       "이미지를 표시할 수 없습니다. 원문을 확인해주세요.",
       async function () {
         var result = await getPreview(article.id);
@@ -1754,8 +1915,14 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
       overview.append(el("dt", "", label), el("dd", "", value));
     }
 
-    if ((article.names || []).length) row("관련 건축가", article.names.join(" / "));
-    if ((article.matchedTerms || []).length) row("발견 검색어", article.matchedTerms.join(" · "));
+    if ((article.names || []).length) {
+      row("관련 건축가", article.names.join(" / "));
+    }
+
+    if ((article.matchedTerms || []).length) {
+      row("발견 검색어", article.matchedTerms.join(" · "));
+    }
+
     row("매체", article.source);
     row("발행일", dateText(article.publishedAt));
 
@@ -1769,6 +1936,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
         "면적·위치·준공 연도는 RSS에 명시된 경우에만 표시합니다. " +
         "발견 검색어는 관련성을 검증한 정보가 아닙니다.")
     );
+
     content.append(section("개요", overviewBox));
 
     var summary = el("div");
@@ -1782,8 +1950,12 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
 
     if (article.summary) {
       var translate = new URL("https://translate.google.com/");
+
       translate.search = new URLSearchParams({
-        sl: "auto", tl: "ko", text: article.summary, op: "translate"
+        sl: "auto",
+        tl: "ko",
+        text: article.summary,
+        op: "translate"
       }).toString();
 
       var translateLink = el("a", "translate-link", "한국어 번역 보기 ↗");
@@ -1812,6 +1984,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
   async function showDetail(id) {
     home.hidden = true;
     detail.hidden = false;
+
     var cached = articleCache.get(id);
 
     if (cached) {
@@ -1823,90 +1996,107 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
     content.replaceChildren(el("div", "empty", "기사 정보를 불러오고 있습니다…"));
 
     try {
-      var remote = await getPreview(id);
+      var article = await getPreview(id);
       if (location.hash !== "#article=" + id) return;
-      paintDetail(Object.assign({}, remote, { names: [], matchedTerms: [] }));
+      paintDetail(Object.assign({}, article, {
+        names: [],
+        matchedTerms: []
+      }));
     } catch (error) {
       content.replaceChildren(el("div", "empty",
-        "이 기사는 현재 조회할 수 없습니다. 홈에서 다시 검색한 뒤 열어주세요."));
+        "기사를 조회하지 못했습니다. 홈에서 다시 검색한 뒤 열어주세요."));
     }
   }
 
   function route() {
     var match = location.hash.match(/^#article=([a-f0-9]{24})$/);
+
     if (match) {
       showDetail(match[1]);
     } else {
       home.hidden = false;
       detail.hidden = true;
       document.title = "FORM — Follow the Trace";
-      ensureHome();
     }
   }
+
+  loadLocalData();
+  renderProfiles();
+  renderAwards();
+  renderFeed();
 
   document.getElementById("followingTab").addEventListener("click", function () {
     setTab("following");
   });
+
   document.getElementById("awardsTab").addEventListener("click", function () {
     setTab("awards");
   });
+
   document.getElementById("awardSearch").addEventListener("input", renderAwards);
   document.getElementById("awardSort").addEventListener("change", renderAwards);
-  search.addEventListener("input", function () {
-    if (initialized) renderFeed();
-  });
+  search.addEventListener("input", renderFeed);
 
   document.getElementById("addForm").addEventListener("submit", function (event) {
     event.preventDefault();
-    if (!initialized) {
-      alert("서버 연결이 완료된 뒤 다시 시도해주세요.");
-      return;
-    }
 
     var input = document.getElementById("architectName");
     var related = document.getElementById("architectKeywords");
     var message = document.getElementById("addMessage");
 
     try {
-      var profile = addToMyList(input.value, related.value);
+      var profile = addArchitect(input.value, related.value);
       input.value = "";
       related.value = "";
-      message.textContent = profile.name + "을(를) 내 목록에 추가했습니다.";
+
+      message.textContent = profile.name + (
+        isFollowed(profile.id)
+          ? "을(를) 내 목록에 추가했습니다."
+          : "을(를) 추가했습니다. 다른 팔로우를 해제한 뒤 선택할 수 있습니다."
+      );
+
       renderProfiles();
       renderAwards();
-      loadNews();
+      scheduleSearch();
     } catch (error) {
       message.textContent = error.message;
     }
   });
 
-  document.getElementById("refresh").addEventListener("click", function () {
-    if (initialized) {
-      previewRequests.clear();
+  document.getElementById("refresh").addEventListener("click", async function () {
+    if (loading) return;
+    previewRequests.clear();
+
+    if (await checkConnection()) {
       loadNews();
-    } else {
-      ensureHome();
     }
   });
 
   window.addEventListener("hashchange", route);
 
   setInterval(function () {
-    if (initialized && !document.hidden && !loading && !detail.hidden) return;
-    if (initialized && !document.hidden && !loading) loadNews();
+    if (!document.hidden && !loading && detail.hidden) {
+      loadNews();
+    }
   }, 30 * 60 * 1000);
 
   route();
+
+  checkConnection().then(function (ok) {
+    if (ok && detail.hidden && state.followed.length) {
+      loadNews();
+    }
+  });
 })();
 </script>
 </body>
 </html>`;
 
 // --------------------------------------------------
-// API / 서버
+// API / HTTP 응답
 // --------------------------------------------------
 
-function securityHeaders() {
+function commonHeaders() {
   return {
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
@@ -1917,14 +2107,17 @@ function securityHeaders() {
 
 function sendJSON(response, status, data) {
   response.writeHead(status, {
-    ...securityHeaders(),
+    ...commonHeaders(),
     "Content-Type": "application/json; charset=utf-8"
   });
+
   response.end(JSON.stringify(data));
 }
 
 async function readJSON(request) {
-  const contentType = String(request.headers["content-type"] || "").toLowerCase();
+  const contentType = String(
+    request.headers["content-type"] || ""
+  ).toLowerCase();
 
   if (!contentType.startsWith("application/json")) {
     const error = new Error("JSON 형식이 필요합니다.");
@@ -1932,15 +2125,14 @@ async function readJSON(request) {
     throw error;
   }
 
-  const origin = request.headers.origin;
+  if (request.headers.origin) {
+    let valid = false;
 
-  if (origin) {
-    let sameHost = false;
     try {
-      sameHost = new URL(origin).host === request.headers.host;
+      valid = new URL(request.headers.origin).host === request.headers.host;
     } catch {}
 
-    if (!sameHost) {
+    if (!valid) {
       const error = new Error("허용되지 않는 요청입니다.");
       error.status = 403;
       throw error;
@@ -1963,8 +2155,14 @@ async function readJSON(request) {
   }
 
   try {
-    const data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error();
+    const data = JSON.parse(
+      Buffer.concat(chunks).toString("utf8")
+    );
+
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new Error();
+    }
+
     return data;
   } catch {
     const error = new Error("입력 내용을 읽지 못했습니다.");
@@ -1978,12 +2176,18 @@ const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, "http://localhost");
 
     if (request.method === "GET" && url.pathname === "/") {
+      const nonce = randomBytes(18).toString("base64");
+
+      const html = PAGE
+        .replace("__CATALOG__", () => safeJSON(CATALOG))
+        .replace(/__NONCE__/g, nonce);
+
       response.writeHead(200, {
-        ...securityHeaders(),
+        ...commonHeaders(),
         "Content-Type": "text/html; charset=utf-8",
         "Content-Security-Policy":
           "default-src 'self'; " +
-          "script-src 'self' 'unsafe-inline'; " +
+          "script-src 'nonce-" + nonce + "'; " +
           "style-src 'self' 'unsafe-inline'; " +
           "img-src https: data:; " +
           "connect-src 'self'; " +
@@ -1991,12 +2195,23 @@ const server = http.createServer(async (request, response) => {
           "frame-ancestors 'none'; " +
           "form-action 'self'"
       });
-      response.end(HTML);
+
+      response.end(html);
       return;
     }
 
     if (request.method === "GET" && url.pathname === "/health") {
-      sendJSON(response, 200, { ok: true });
+      sendJSON(response, 200, {
+        ok: true,
+        app: "FORM",
+        version: "2.0.0"
+      });
+      return;
+    }
+
+    if (request.method === "HEAD" && url.pathname === "/health") {
+      response.writeHead(200, commonHeaders());
+      response.end();
       return;
     }
 
@@ -2015,24 +2230,14 @@ const server = http.createServer(async (request, response) => {
       ) {
         response.setHeader("Retry-After", "60");
         sendJSON(response, 429, {
-          error: "요청이 많습니다. 1분 정도 기다렸다가 다시 시도해주세요."
+          error: "요청이 많습니다. 1분 정도 기다린 뒤 다시 시도해주세요."
         });
         return;
       }
     }
 
     if (request.method === "GET" && url.pathname === "/api/catalog") {
-      sendJSON(response, 200, {
-        defaults: DEFAULT_ARCHITECTS,
-        throughYear: 2026,
-        laureates: PRITZKER.map(([year, names]) => ({
-          year,
-          people: names.map(name => ({
-            name,
-            keywords: LAUREATE_KEYWORDS[name] || []
-          }))
-        }))
-      });
+      sendJSON(response, 200, CATALOG);
       return;
     }
 
@@ -2040,7 +2245,7 @@ const server = http.createServer(async (request, response) => {
       if (!allowRate("client-search:" + clientKey(request), 30)) {
         response.setHeader("Retry-After", "60");
         sendJSON(response, 429, {
-          error: "검색 요청이 많습니다. 1분 뒤에 다시 시도해주세요."
+          error: "검색 요청이 많습니다. 1분 뒤 다시 시도해주세요."
         });
         return;
       }
@@ -2058,21 +2263,27 @@ const server = http.createServer(async (request, response) => {
         return;
       }
 
-      const name = cleanText(data.name, 80);
-      const keywords = cleanKeywords(data.keywords);
-
       try {
-        sendJSON(response, 200, await collectFeed(name, keywords));
+        const result = await collectFeed(
+          cleanText(data.name, 80),
+          cleanKeywords(data.keywords)
+        );
+
+        sendJSON(response, 200, result);
       } catch (error) {
-        console.error("[검색 실패]", error.message);
+        console.error("[뉴스 검색 실패]", error.message);
+
         sendJSON(response, 502, {
-          error: "뉴스 검색에 실패했습니다. 잠시 후 다시 시도해주세요."
+          error: "서버는 실행 중이지만 외부 뉴스 검색에 실패했습니다. 잠시 후 다시 시도해주세요."
         });
       }
+
       return;
     }
 
-    const articleMatch = url.pathname.match(/^\/api\/article\/([a-f0-9]{24})$/);
+    const articleMatch = url.pathname.match(
+      /^\/api\/article\/([a-f0-9]{24})$/
+    );
 
     if (request.method === "GET" && articleMatch) {
       const article = await getArticleWithPreview(articleMatch[1]);
@@ -2088,7 +2299,9 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    sendJSON(response, 404, { error: "페이지를 찾을 수 없습니다." });
+    sendJSON(response, 404, {
+      error: "페이지를 찾을 수 없습니다."
+    });
   } catch (error) {
     console.error("[서버 오류]", error.message);
 
@@ -2096,7 +2309,7 @@ const server = http.createServer(async (request, response) => {
       sendJSON(response, error.status || 500, {
         error: error.status
           ? error.message
-          : "서버 처리에 실패했습니다. 잠시 후 다시 시도해주세요."
+          : "서버 처리 중 오류가 발생했습니다."
       });
     } else {
       response.end();
@@ -2104,17 +2317,21 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-// 공개 호스팅을 위해 0.0.0.0으로 실행합니다.
 server.listen(PORT, "0.0.0.0", () => {
   console.log("");
   console.log("FORM — FOLLOW THE TRACE");
   console.log("로컬 주소: http://localhost:" + PORT);
-  console.log("개인 목록은 각 방문자의 브라우저에 저장됩니다.");
+  console.log("상태 확인: http://localhost:" + PORT + "/health");
+  console.log("종료: Ctrl + C");
   console.log("");
 });
 
 server.on("error", error => {
   console.error("서버 실행 실패:", error.message);
+
+  if (error.code === "EADDRINUSE") {
+    console.error("기존 실행 창에서 Ctrl + C를 눌러 서버를 종료해주세요.");
+  }
 });
 
 // END OF FILE
