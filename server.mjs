@@ -136,6 +136,7 @@ const PRITZKER = [
   [2023, ["David Chipperfield"]],
   [2024, ["Riken Yamamoto"]],
   [2025, ["Liu Jiakun"]]
+  [2026, ["Smiljan Radić Clarke"]]
 ];
 
 const LAUREATE_KEYWORDS = {
@@ -170,7 +171,8 @@ const LAUREATE_KEYWORDS = {
   "Jean-Philippe Vassal": ["Lacaton Vassal"],
   "Diébédo Francis Kéré": ["Francis Kere", "Kere Architecture"],
   "Riken Yamamoto": ["Riken Yamamoto Field Shop"],
-  "Liu Jiakun": ["Jiakun Architects", "West Village Chengdu"]
+  "Liu Jiakun": ["Jiakun Architects", "West Village Chengdu"],
+  "Smiljan Radić Clarke": ["Smiljan Radic", "Smiljan Radić", "Serpentine Pavilion 2014", "Teatro Regional del Biobio"]
 };
 
 const queryCache = new Map();
@@ -978,7 +980,7 @@ footer{padding:28px 0;border-top:1px solid var(--line);color:var(--muted);font-s
     <div class="awards-heading">
       <div class="eyebrow">THE PRITZKER ARCHITECTURE PRIZE</div>
       <h2>Laureates.</h2>
-      <p>1979–2025 수상자 수록 · 공동 수상자 포함</p>
+      <p>1979–2026 수상자 수록 · 공동 수상자 포함</p>
       <p>
         <a href="https://www.pritzkerprize.com/laureates" target="_blank" rel="noopener noreferrer">
           공식 명단 ↗
@@ -2022,7 +2024,7 @@ const server = http.createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/api/catalog") {
       sendJSON(response, 200, {
         defaults: DEFAULT_ARCHITECTS,
-        throughYear: 2025,
+        throughYear: 2026,
         laureates: PRITZKER.map(([year, names]) => ({
           year,
           people: names.map(name => ({
